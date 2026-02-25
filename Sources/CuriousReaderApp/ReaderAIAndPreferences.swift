@@ -37,34 +37,66 @@ enum ReaderFontStyle: String, CaseIterable, Codable, Identifiable, Sendable {
 }
 
 struct ReaderPreferences: Codable, Equatable, Sendable {
+    struct AutoImportDirectory: Codable, Equatable, Sendable, Identifiable {
+        var path: String
+        var bookmarkData: Data?
+
+        var id: String { path }
+    }
+
     var epubFontStyle: ReaderFontStyle
     var epubFontSize: Double
+    var autoImportDirectories: [AutoImportDirectory]
 
     static let `default` = ReaderPreferences(
         epubFontStyle: .systemSans,
-        epubFontSize: 19
+        epubFontSize: 19,
+        autoImportDirectories: []
     )
 
     private enum CodingKeys: String, CodingKey {
         case epubFontStyle
         case epubFontSize
+        case autoImportDirectories
+        // Legacy single-directory keys (kept for backward compatibility).
+        case autoImportDirectoryPath
+        case autoImportDirectoryBookmarkData
     }
 
-    init(epubFontStyle: ReaderFontStyle, epubFontSize: Double) {
+    init(
+        epubFontStyle: ReaderFontStyle,
+        epubFontSize: Double,
+        autoImportDirectories: [AutoImportDirectory] = []
+    ) {
         self.epubFontStyle = epubFontStyle
         self.epubFontSize = epubFontSize
+        self.autoImportDirectories = autoImportDirectories
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         epubFontStyle = try container.decodeIfPresent(ReaderFontStyle.self, forKey: .epubFontStyle) ?? .systemSans
         epubFontSize = try container.decodeIfPresent(Double.self, forKey: .epubFontSize) ?? 19
+        if let directories = try container.decodeIfPresent([AutoImportDirectory].self, forKey: .autoImportDirectories) {
+            autoImportDirectories = directories
+        } else {
+            let legacyPath = try container.decodeIfPresent(String.self, forKey: .autoImportDirectoryPath)
+            let legacyBookmark = try container.decodeIfPresent(Data.self, forKey: .autoImportDirectoryBookmarkData)
+            if let legacyPath, !legacyPath.isEmpty {
+                autoImportDirectories = [
+                    AutoImportDirectory(path: legacyPath, bookmarkData: legacyBookmark),
+                ]
+            } else {
+                autoImportDirectories = []
+            }
+        }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(epubFontStyle, forKey: .epubFontStyle)
         try container.encode(epubFontSize, forKey: .epubFontSize)
+        try container.encode(autoImportDirectories, forKey: .autoImportDirectories)
     }
 }
 

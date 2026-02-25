@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 import PDFKit
@@ -125,6 +126,7 @@ final class ReaderWorkspaceModel: ObservableObject {
     @Published private(set) var pendingSelectionText: String?
     @Published private(set) var isOpeningBook = false
     @Published private(set) var openingBookTitle: String?
+    @Published var isAutoImportFolderPickerPresented = false
 
     private let importService = BookImportService()
     private let pdfEngine = PDFReaderEngine()
@@ -142,8 +144,12 @@ final class ReaderWorkspaceModel: ObservableObject {
     private var translationMemoryByBookID: [UUID: [String: String]] = [:]
     private var securityScopedAccessedPaths: Set<String> = []
     private var activeBookID: UUID?
+    private var autoImportRootDirectoryURLs: [URL] = []
     private var searchTask: Task<Void, Never>?
     private var translationTask: Task<Void, Never>?
+    private var autoImportDirectoryMonitors: [String: DispatchSourceFileSystemObject] = [:]
+    private var autoImportDirectoryMonitorAccessURLs: [String: URL] = [:]
+    private var autoImportDirectoryMonitorDebounceTask: Task<Void, Never>?
 
     init() {
         Task {
@@ -155,6 +161,8 @@ final class ReaderWorkspaceModel: ObservableObject {
         await loadPreferences()
         await loadTranslationMemory()
         await restoreLibrary()
+        await autoImportFromConfiguredDirectories()
+        startAutoImportDirectoryMonitoring()
     }
 
     private func loadPreferences() async {
@@ -164,6 +172,7 @@ final class ReaderWorkspaceModel: ObservableObject {
             preferences = .default
             lastError = "Failed to load preferences: \(error.localizedDescription)"
         }
+        refreshAutoImportRootDirectoryURLs()
         hasOpenRouterAPIKey = OpenRouterKeychainStore.load() != nil
     }
 
@@ -208,6 +217,197 @@ final class ReaderWorkspaceModel: ObservableObject {
     func removeOpenRouterAPIKey() {
         OpenRouterKeychainStore.delete()
         hasOpenRouterAPIKey = false
+    }
+
+    func configureAutoImportDirectory(url: URL, bookmarkData: Data?) {
+        let normalizedPath = Self.normalizedPath(for: url)
+        var bookmarksByPath: [String: Data] = [:]
+        if let bookmarkData {
+            bookmarksByPath[normalizedPath] = bookmarkData
+        }
+        configureAutoImportDirectories(
+            urls: [url],
+            bookmarkDataByPath: bookmarksByPath
+        )
+    }
+
+    func clearAutoImportDirectory() {
+        clearAutoImportDirectories()
+    }
+
+    func configureAutoImportDirectories(urls: [URL], bookmarkDataByPath: [String: Data] = [:]) {
+        guard !urls.isEmpty else {
+            return
+        }
+
+        var didChange = false
+        var importedDirectoryURLs: [URL] = []
+
+        for candidate in urls {
+            let standardizedURL = candidate.standardizedFileURL.resolvingSymlinksInPath()
+            guard Self.isDirectory(standardizedURL) else {
+                continue
+            }
+            let normalizedPath = Self.normalizedPath(for: standardizedURL)
+            let bookmarkData = bookmarkDataByPath[normalizedPath]
+
+            if let existingIndex = preferences.autoImportDirectories.firstIndex(where: {
+                Self.normalizedPath(for: URL(fileURLWithPath: $0.path)) == normalizedPath
+            }) {
+                if let bookmarkData,
+                   preferences.autoImportDirectories[existingIndex].bookmarkData != bookmarkData {
+                    preferences.autoImportDirectories[existingIndex].bookmarkData = bookmarkData
+                    didChange = true
+                }
+                if preferences.autoImportDirectories[existingIndex].path != normalizedPath {
+                    preferences.autoImportDirectories[existingIndex].path = normalizedPath
+                    didChange = true
+                }
+                continue
+            }
+
+            preferences.autoImportDirectories.append(
+                ReaderPreferences.AutoImportDirectory(
+                    path: normalizedPath,
+                    bookmarkData: bookmarkData
+                )
+            )
+            importedDirectoryURLs.append(standardizedURL)
+            didChange = true
+        }
+
+        guard didChange else {
+            return
+        }
+
+        preferences.autoImportDirectories = Self.deduplicateAutoImportDirectories(preferences.autoImportDirectories)
+        refreshAutoImportRootDirectoryURLs()
+        persistPreferencesAsync()
+
+        for directoryURL in importedDirectoryURLs {
+            importBooksFromAutoImportDirectory(
+                directoryURL,
+                preferDirectURLAccess: true
+            )
+        }
+        startAutoImportDirectoryMonitoring(preferredDirectoryURLs: autoImportRootDirectoryURLs)
+    }
+
+    func removeAutoImportDirectory(path: String) {
+        let targetPath = Self.normalizedPath(for: URL(fileURLWithPath: path))
+        let previousRootPaths = Set(autoImportRootDirectoryURLs.map { Self.normalizedPath(for: $0) })
+        let previousCount = preferences.autoImportDirectories.count
+
+        preferences.autoImportDirectories.removeAll {
+            Self.normalizedPath(for: URL(fileURLWithPath: $0.path)) == targetPath
+        }
+
+        guard preferences.autoImportDirectories.count != previousCount else {
+            return
+        }
+
+        preferences.autoImportDirectories = Self.deduplicateAutoImportDirectories(preferences.autoImportDirectories)
+        refreshAutoImportRootDirectoryURLs()
+        persistPreferencesAsync()
+        startAutoImportDirectoryMonitoring(preferredDirectoryURLs: autoImportRootDirectoryURLs)
+
+        let remainingRootPaths = Set(autoImportRootDirectoryURLs.map { Self.normalizedPath(for: $0) })
+        let removedRootPaths = previousRootPaths.subtracting(remainingRootPaths)
+        removeBooksImportedFromRemovedRoots(removedRootPaths, remainingRootPaths: remainingRootPaths)
+    }
+
+    func clearAutoImportDirectories() {
+        guard !preferences.autoImportDirectories.isEmpty else {
+            return
+        }
+        let removedRootPaths = Set(autoImportRootDirectoryURLs.map { Self.normalizedPath(for: $0) })
+        preferences.autoImportDirectories = []
+        refreshAutoImportRootDirectoryURLs()
+        persistPreferencesAsync()
+        stopAutoImportDirectoryMonitoring()
+        removeBooksImportedFromRemovedRoots(removedRootPaths, remainingRootPaths: [])
+    }
+
+    func requestAutoImportFolderSelection() {
+        isAutoImportFolderPickerPresented = true
+    }
+
+    func libraryCategorySnapshot() -> (byBookID: [UUID: String], categories: [String]) {
+        var mapping: [UUID: String] = [:]
+        var categorySet: Set<String> = []
+        for book in books {
+            guard let category = Self.deriveAutoImportCategory(
+                rootDirectoryURLs: autoImportRootDirectoryURLs,
+                fileURL: book.fileURL
+            ) else {
+                continue
+            }
+            mapping[book.id] = category
+            categorySet.insert(category)
+        }
+        let categories = categorySet.sorted { lhs, rhs in
+            lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+        return (mapping, categories)
+    }
+
+    func libraryCategoriesByBookID() -> [UUID: String] {
+        libraryCategorySnapshot().byBookID
+    }
+
+    func libraryCategories() -> [String] {
+        libraryCategorySnapshot().categories
+    }
+
+    func removeBook(_ document: BookDocument) {
+        removeBooks(where: { $0.id == document.id })
+    }
+
+    private func removeBooksImportedFromRemovedRoots(
+        _ removedRootPaths: Set<String>,
+        remainingRootPaths: Set<String>
+    ) {
+        guard !removedRootPaths.isEmpty else {
+            return
+        }
+        removeBooks { document in
+            let bookPath = Self.normalizedPath(for: document.fileURL)
+            if Self.path(bookPath, isUnderAnyRootPath: remainingRootPaths) {
+                return false
+            }
+            return Self.path(bookPath, isUnderAnyRootPath: removedRootPaths)
+        }
+    }
+
+    private func removeBooks(where predicate: (BookDocument) -> Bool) {
+        let removedDocuments = books.filter(predicate)
+        guard !removedDocuments.isEmpty else {
+            return
+        }
+
+        let removedIDs = Set(removedDocuments.map(\.id))
+        let removedPaths = Set(removedDocuments.map { Self.normalizedPath(for: $0.fileURL) })
+
+        books.removeAll { removedIDs.contains($0.id) }
+        readingStatesByBookID = readingStatesByBookID.filter { !removedIDs.contains($0.key) }
+        bookmarkDataByBookID = bookmarkDataByBookID.filter { !removedIDs.contains($0.key) }
+        translationMemoryByBookID = translationMemoryByBookID.filter { !removedIDs.contains($0.key) }
+        sessionCache = sessionCache.filter { !removedPaths.contains(Self.normalizedPath(for: $0.key)) }
+
+        let pathsToRelease = securityScopedAccessedPaths.filter {
+            removedPaths.contains(Self.normalizedPath(for: URL(fileURLWithPath: $0)))
+        }
+        for path in pathsToRelease {
+            URL(fileURLWithPath: path).stopAccessingSecurityScopedResource()
+            securityScopedAccessedPaths.remove(path)
+        }
+
+        if let activeBookID, removedIDs.contains(activeBookID) {
+            closeReaderSession()
+        }
+
+        persistLibraryAsync()
+        persistTranslationMemoryAsync()
     }
 
     func importBooks(from sources: [ImportedBookSource], openFirstImportedBook: Bool = false) {
@@ -755,6 +955,16 @@ final class ReaderWorkspaceModel: ObservableObject {
         }
     }
 
+    private func autoImportFromConfiguredDirectories() async {
+        let directories = resolveConfiguredAutoImportDirectories()
+        for directory in directories {
+            importBooksFromAutoImportDirectory(
+                directory.url,
+                bookmarkData: directory.bookmarkData
+            )
+        }
+    }
+
     private func openSessionWithCache(document: BookDocument) throws -> ActiveSession {
         if let cached = sessionCache[document.fileURL] {
             return cached
@@ -811,8 +1021,343 @@ final class ReaderWorkspaceModel: ObservableObject {
     }
 
     private func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.standardizedFileURL.resolvingSymlinksInPath().path
-            == rhs.standardizedFileURL.resolvingSymlinksInPath().path
+        Self.normalizedPath(for: lhs) == Self.normalizedPath(for: rhs)
+    }
+
+    private func importBooksFromAutoImportDirectory(
+        _ directoryURL: URL,
+        bookmarkData: Data? = nil,
+        preferDirectURLAccess: Bool = false
+    ) {
+        var accessURL = directoryURL.standardizedFileURL
+        var canAccessDirectory = false
+        if !preferDirectURLAccess,
+           let bookmarkData {
+            var stale = false
+            if let resolved = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: [.withoutUI, .withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ) {
+                accessURL = resolved.standardizedFileURL
+                canAccessDirectory = accessURL.startAccessingSecurityScopedResource()
+            }
+        }
+        if !canAccessDirectory {
+            canAccessDirectory = accessURL.startAccessingSecurityScopedResource()
+        }
+        defer {
+            if canAccessDirectory {
+                accessURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        guard Self.isDirectory(accessURL) else {
+            return
+        }
+
+        let existingPaths = Set(books.map { $0.fileURL.standardizedFileURL.resolvingSymlinksInPath().path })
+        let candidateURLs = Self.discoverImportableBooks(in: accessURL)
+        guard !candidateURLs.isEmpty else {
+            return
+        }
+
+        var seenPaths = existingPaths
+        var sources: [ImportedBookSource] = []
+        sources.reserveCapacity(candidateURLs.count)
+        for fileURL in candidateURLs {
+            let normalizedPath = fileURL.standardizedFileURL.resolvingSymlinksInPath().path
+            guard !seenPaths.contains(normalizedPath) else {
+                continue
+            }
+            seenPaths.insert(normalizedPath)
+            let bookmarkData = try? fileURL.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            sources.append(
+                ImportedBookSource(
+                    fileURL: fileURL,
+                    securityScopedBookmarkData: bookmarkData
+                )
+            )
+        }
+
+        guard !sources.isEmpty else {
+            return
+        }
+        importBooks(from: sources, openFirstImportedBook: false)
+    }
+
+    private struct ResolvedAutoImportDirectory {
+        let url: URL
+        let path: String
+        let bookmarkData: Data?
+    }
+
+    private func resolveConfiguredAutoImportDirectories() -> [ResolvedAutoImportDirectory] {
+        var resolved: [ResolvedAutoImportDirectory] = []
+        var normalizedPreferences = Self.deduplicateAutoImportDirectories(preferences.autoImportDirectories)
+        var didMutate = normalizedPreferences != preferences.autoImportDirectories
+        var hasResolvedStaleBookmark = false
+
+        for index in normalizedPreferences.indices {
+            var entry = normalizedPreferences[index]
+            if let bookmarkData = entry.bookmarkData {
+                var stale = false
+                if let resolvedURL = try? URL(
+                    resolvingBookmarkData: bookmarkData,
+                    options: [.withoutUI, .withSecurityScope],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &stale
+                ) {
+                    let normalizedURL = resolvedURL.standardizedFileURL.resolvingSymlinksInPath()
+                    let normalizedPath = Self.normalizedPath(for: normalizedURL)
+                    if entry.path != normalizedPath {
+                        entry.path = normalizedPath
+                        didMutate = true
+                    }
+                    if stale,
+                       let refreshed = try? resolvedURL.bookmarkData(
+                            options: [.withSecurityScope],
+                            includingResourceValuesForKeys: nil,
+                            relativeTo: nil
+                       ) {
+                        entry.bookmarkData = refreshed
+                        didMutate = true
+                        hasResolvedStaleBookmark = true
+                    }
+                    normalizedPreferences[index] = entry
+                    resolved.append(
+                        ResolvedAutoImportDirectory(
+                            url: normalizedURL,
+                            path: normalizedPath,
+                            bookmarkData: entry.bookmarkData
+                        )
+                    )
+                    continue
+                }
+            }
+
+            let fallbackURL = URL(fileURLWithPath: entry.path).standardizedFileURL.resolvingSymlinksInPath()
+            let fallbackPath = Self.normalizedPath(for: fallbackURL)
+            if entry.path != fallbackPath {
+                entry.path = fallbackPath
+                didMutate = true
+            }
+            normalizedPreferences[index] = entry
+            resolved.append(
+                ResolvedAutoImportDirectory(
+                    url: fallbackURL,
+                    path: fallbackPath,
+                    bookmarkData: entry.bookmarkData
+                )
+            )
+        }
+
+        normalizedPreferences = Self.deduplicateAutoImportDirectories(normalizedPreferences)
+        if normalizedPreferences != preferences.autoImportDirectories {
+            preferences.autoImportDirectories = normalizedPreferences
+            refreshAutoImportRootDirectoryURLs()
+            persistPreferencesAsync()
+        } else if didMutate || hasResolvedStaleBookmark {
+            preferences.autoImportDirectories = normalizedPreferences
+            refreshAutoImportRootDirectoryURLs()
+            persistPreferencesAsync()
+        }
+
+        var seenPaths: Set<String> = []
+        return resolved.compactMap { directory in
+            guard seenPaths.insert(directory.path).inserted else {
+                return nil
+            }
+            return directory
+        }
+    }
+
+    private func startAutoImportDirectoryMonitoring(preferredDirectoryURLs: [URL]? = nil) {
+        stopAutoImportDirectoryMonitoring()
+
+        let directoryURLs: [URL]
+        if let preferredDirectoryURLs {
+            directoryURLs = preferredDirectoryURLs.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+        } else {
+            directoryURLs = resolveConfiguredAutoImportDirectories().map(\.url)
+        }
+
+        guard !directoryURLs.isEmpty else {
+            return
+        }
+
+        for directoryURL in directoryURLs {
+            guard Self.isDirectory(directoryURL) else {
+                continue
+            }
+
+            let normalizedPath = Self.normalizedPath(for: directoryURL)
+            guard autoImportDirectoryMonitors[normalizedPath] == nil else {
+                continue
+            }
+
+            let hasSecurityScope = directoryURL.startAccessingSecurityScopedResource()
+            let fileDescriptor = Darwin.open(directoryURL.path, O_EVTONLY)
+            guard fileDescriptor >= 0 else {
+                if hasSecurityScope {
+                    directoryURL.stopAccessingSecurityScopedResource()
+                }
+                continue
+            }
+
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fileDescriptor,
+                eventMask: [.write, .rename, .delete, .extend, .attrib],
+                queue: DispatchQueue.main
+            )
+            source.setEventHandler { [weak self] in
+                self?.scheduleAutoImportDirectoryRefresh()
+            }
+            source.setCancelHandler {
+                Darwin.close(fileDescriptor)
+            }
+
+            autoImportDirectoryMonitors[normalizedPath] = source
+            if hasSecurityScope {
+                autoImportDirectoryMonitorAccessURLs[normalizedPath] = directoryURL
+            }
+            source.resume()
+        }
+    }
+
+    private func stopAutoImportDirectoryMonitoring() {
+        autoImportDirectoryMonitorDebounceTask?.cancel()
+        autoImportDirectoryMonitorDebounceTask = nil
+
+        for source in autoImportDirectoryMonitors.values {
+            source.cancel()
+        }
+        autoImportDirectoryMonitors.removeAll()
+
+        for accessURL in autoImportDirectoryMonitorAccessURLs.values {
+            accessURL.stopAccessingSecurityScopedResource()
+        }
+        autoImportDirectoryMonitorAccessURLs.removeAll()
+    }
+
+    private func scheduleAutoImportDirectoryRefresh() {
+        autoImportDirectoryMonitorDebounceTask?.cancel()
+        autoImportDirectoryMonitorDebounceTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            await autoImportFromConfiguredDirectories()
+        }
+    }
+
+    private static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+    }
+
+    private static func discoverImportableBooks(in directoryURL: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let importableExtensions = Set(["pdf", "epub", "mobi", "prc", "azw"])
+        var urls: [URL] = []
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else {
+                continue
+            }
+            guard importableExtensions.contains(fileURL.pathExtension.lowercased()) else {
+                continue
+            }
+            urls.append(fileURL)
+        }
+        return urls.sorted {
+            $0.standardizedFileURL.path < $1.standardizedFileURL.path
+        }
+    }
+
+    private func refreshAutoImportRootDirectoryURLs() {
+        autoImportRootDirectoryURLs = Self.deduplicateAutoImportDirectories(preferences.autoImportDirectories)
+            .map { URL(fileURLWithPath: $0.path) }
+            .map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+    }
+
+    private static func normalizedPath(for url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private static func deduplicateAutoImportDirectories(
+        _ directories: [ReaderPreferences.AutoImportDirectory]
+    ) -> [ReaderPreferences.AutoImportDirectory] {
+        var result: [ReaderPreferences.AutoImportDirectory] = []
+        var pathToIndex: [String: Int] = [:]
+
+        for directory in directories {
+            let normalizedPath = Self.normalizedPath(for: URL(fileURLWithPath: directory.path))
+            if let index = pathToIndex[normalizedPath] {
+                if result[index].bookmarkData == nil, let bookmarkData = directory.bookmarkData {
+                    result[index].bookmarkData = bookmarkData
+                }
+                continue
+            }
+            let normalized = ReaderPreferences.AutoImportDirectory(
+                path: normalizedPath,
+                bookmarkData: directory.bookmarkData
+            )
+            pathToIndex[normalizedPath] = result.count
+            result.append(normalized)
+        }
+        return result
+    }
+
+    private static func path(_ filePath: String, isUnderAnyRootPath rootPaths: Set<String>) -> Bool {
+        for rootPath in rootPaths {
+            let normalizedRoot = rootPath.hasSuffix("/") ? String(rootPath.dropLast()) : rootPath
+            let prefix = normalizedRoot + "/"
+            if filePath == normalizedRoot || filePath.hasPrefix(prefix) {
+                return true
+            }
+        }
+        return false
+    }
+
+    nonisolated static func deriveAutoImportCategory(rootDirectoryURL: URL?, fileURL: URL) -> String? {
+        guard let rootDirectoryURL else {
+            return nil
+        }
+        return deriveAutoImportCategory(rootDirectoryURLs: [rootDirectoryURL], fileURL: fileURL)
+    }
+
+    nonisolated static func deriveAutoImportCategory(rootDirectoryURLs: [URL], fileURL: URL) -> String? {
+        guard !rootDirectoryURLs.isEmpty else {
+            return nil
+        }
+        let bookPath = fileURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let sortedRoots = rootDirectoryURLs
+            .map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
+            .sorted { $0.count > $1.count }
+
+        for rootPath in sortedRoots {
+            let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            guard bookPath.hasPrefix(prefix) else {
+                continue
+            }
+            let relativePath = String(bookPath.dropFirst(prefix.count))
+            let components = relativePath.split(separator: "/")
+            guard components.count >= 2 else {
+                continue
+            }
+            return String(components[0])
+        }
+        return nil
     }
 
     private func resolveDocumentForOpen(_ document: BookDocument) -> BookDocument {

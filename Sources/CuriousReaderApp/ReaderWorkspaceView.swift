@@ -70,13 +70,19 @@ struct ReaderWorkspaceView: View {
     var body: some View {
         ZStack {
             if model.activeSession == nil {
+                let categorySnapshot = model.libraryCategorySnapshot()
                 LibraryShelfView(
                     books: model.books,
                     recentlyReadBooks: model.recentlyReadBooks(limit: 5),
+                    categoryByBookID: categorySnapshot.byBookID,
+                    categories: categorySnapshot.categories,
                     lastOpenedAt: { model.lastOpenedDate(for: $0) },
                     onImport: { isImporterPresented = true },
                     onOpen: { book in
                         model.openWithLoading(document: book)
+                    },
+                    onDelete: { book in
+                        model.removeBook(book)
                     }
                 )
                 .transition(
@@ -182,6 +188,16 @@ struct ReaderWorkspaceView: View {
                 model.lastError = error.localizedDescription
             }
         }
+        .onChange(of: model.isAutoImportFolderPickerPresented) { _, isPresented in
+            guard isPresented else {
+                return
+            }
+            model.isAutoImportFolderPickerPresented = false
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(220))
+                presentAutoImportDirectoryPanel()
+            }
+        }
         .alert(
             "Open Failed",
             isPresented: Binding(
@@ -194,6 +210,50 @@ struct ReaderWorkspaceView: View {
             }
         } message: {
             Text(model.lastError ?? "")
+        }
+    }
+
+    private func presentAutoImportDirectoryPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Auto-Import Folder"
+        panel.message = "Curious Reader will auto-import books from this folder."
+        panel.prompt = "Select"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.canCreateDirectories = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK else {
+                return
+            }
+            let selectedURLs = panel.urls
+            guard !selectedURLs.isEmpty else {
+                return
+            }
+            DispatchQueue.main.async {
+                var bookmarkDataByPath: [String: Data] = [:]
+                for selectedURL in selectedURLs {
+                    let normalizedPath = selectedURL.standardizedFileURL.resolvingSymlinksInPath().path
+                    if let bookmarkData = try? selectedURL.bookmarkData(
+                        options: [.withSecurityScope],
+                        includingResourceValuesForKeys: nil,
+                        relativeTo: nil
+                    ) {
+                        bookmarkDataByPath[normalizedPath] = bookmarkData
+                    }
+                }
+                self.model.configureAutoImportDirectories(
+                    urls: selectedURLs,
+                    bookmarkDataByPath: bookmarkDataByPath
+                )
+            }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
         }
     }
 }
@@ -274,14 +334,29 @@ private struct LibraryShelfView: View {
         var id: String { rawValue }
     }
 
+    private enum BrowseMode: String, Identifiable {
+        case all
+        case category
+
+        var id: String { rawValue }
+    }
+
+    private static let uncategorizedLabel = "Uncategorized"
+
     let books: [BookDocument]
     let recentlyReadBooks: [BookDocument]
+    let categoryByBookID: [UUID: String]
+    let categories: [String]
     let lastOpenedAt: (UUID) -> Date?
     let onImport: () -> Void
     let onOpen: (BookDocument) -> Void
+    let onDelete: (BookDocument) -> Void
     @State private var searchQuery = ""
     @State private var displayMode: DisplayMode = .cards
+    @State private var browseMode: BrowseMode = .all
+    @State private var selectedCategory = ""
     @State private var currentPage = 1
+    @State private var pendingDeletionBook: BookDocument?
 
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: 252, maximum: 252), spacing: 24, alignment: .top)]
@@ -291,11 +366,44 @@ private struct LibraryShelfView: View {
         searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private var filteredBooks: [BookDocument] {
-        guard !normalizedSearchQuery.isEmpty else {
+    private var hasUncategorizedBooks: Bool {
+        books.contains { categoryByBookID[$0.id] == nil }
+    }
+
+    private var categoryOptions: [String] {
+        var options = categories
+        if hasUncategorizedBooks {
+            options.append(Self.uncategorizedLabel)
+        }
+        return options
+    }
+
+    private var browseScopedBooks: [BookDocument] {
+        guard browseMode == .category else {
             return books
         }
-        return books.filter { book in
+        let activeCategory = selectedCategoryForDisplay
+        guard !activeCategory.isEmpty else {
+            return []
+        }
+        if activeCategory == Self.uncategorizedLabel {
+            return books.filter { categoryByBookID[$0.id] == nil }
+        }
+        return books.filter { categoryByBookID[$0.id] == activeCategory }
+    }
+
+    private var selectedCategoryForDisplay: String {
+        if !selectedCategory.isEmpty {
+            return selectedCategory
+        }
+        return categoryOptions.first ?? ""
+    }
+
+    private var filteredBooks: [BookDocument] {
+        guard !normalizedSearchQuery.isEmpty else {
+            return browseScopedBooks
+        }
+        return browseScopedBooks.filter { book in
             let titleMatches = book.title.lowercased().contains(normalizedSearchQuery)
             let fileMatches = book.fileURL.lastPathComponent.lowercased().contains(normalizedSearchQuery)
             return titleMatches || fileMatches
@@ -336,246 +444,10 @@ private struct LibraryShelfView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [ReaderPalette.canvasTop, ReaderPalette.canvasBottom],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
-
+            shelfBackground
             VStack(alignment: .leading, spacing: 22) {
-                HStack(alignment: .bottom, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Curious Library")
-                            .font(.system(size: 44, weight: .bold, design: .rounded))
-                            .tracking(-0.9)
-                        Text("A focused shelf for PDF, EPUB, and MOBI.")
-                            .font(.system(size: 15, weight: .medium, design: .rounded))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                    Text("\(books.count) books")
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(ReaderPalette.accent)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(
-                            Capsule()
-                                .fill(ReaderPalette.accent.opacity(0.13))
-                        )
-                    Button {
-                        onImport()
-                    } label: {
-                        Label("Import", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(ReaderPalette.accent)
-                    .controlSize(.large)
-                }
-                .padding(.horizontal, 30)
-                .padding(.top, 26)
-
-                Group {
-                    if books.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: "books.vertical")
-                                .font(.system(size: 30, weight: .semibold))
-                                .foregroundStyle(ReaderPalette.accent)
-                            Text("No Books Yet")
-                                .font(.system(size: 20, weight: .semibold, design: .rounded))
-                            Text("Import PDF, EPUB, or MOBI files to build your shelf.")
-                                .font(.system(size: 13, weight: .medium, design: .rounded))
-                                .foregroundStyle(.secondary)
-                            Button("Import Your First Book") {
-                                onImport()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(ReaderPalette.accent)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 28) {
-                                if !recentlyReadBooks.isEmpty {
-                                    VStack(alignment: .leading, spacing: 12) {
-                                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                            Text("Continue Reading")
-                                                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                                .foregroundStyle(.secondary)
-                                                .textCase(.uppercase)
-                                                .tracking(1.0)
-                                            Text("\(recentlyReadBooks.count)")
-                                                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                                .foregroundStyle(.secondary)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 4)
-                                                .background(Capsule().fill(.white.opacity(0.5)))
-                                        }
-                                        ScrollView(.horizontal) {
-                                            LazyHStack(spacing: 14) {
-                                                ForEach(recentlyReadBooks) { book in
-                                                    Button {
-                                                        onOpen(book)
-                                                    } label: {
-                                                        RecentReadingCard(
-                                                            book: book,
-                                                            lastOpenedAt: lastOpenedAt(book.id)
-                                                        )
-                                                    }
-                                                    .buttonStyle(.plain)
-                                                }
-                                            }
-                                            .padding(.vertical, 2)
-                                        }
-                                        .scrollIndicators(.hidden)
-                                    }
-                                    .padding(16)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                            .fill(.white.opacity(0.45))
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                                    .strokeBorder(.white.opacity(0.7), lineWidth: 1)
-                                            )
-                                            .shadow(color: .black.opacity(0.04), radius: 10, x: 0, y: 6)
-                                    )
-                                }
-
-                                Divider()
-                                    .overlay(ReaderPalette.accent.opacity(0.2))
-                                    .padding(.horizontal, 2)
-
-                                VStack(alignment: .leading, spacing: 12) {
-                                    HStack(spacing: 10) {
-                                        Text("Library")
-                                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                            .foregroundStyle(.secondary)
-                                            .textCase(.uppercase)
-                                            .tracking(1.0)
-                                        Spacer(minLength: 0)
-                                        Text("\(filteredBooks.count)")
-                                            .font(.system(size: 11, weight: .semibold, design: .rounded))
-                                            .foregroundStyle(.secondary)
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 4)
-                                            .background(Capsule().fill(.white.opacity(0.52)))
-                                    }
-
-                                    HStack(spacing: 10) {
-                                        HStack(spacing: 8) {
-                                            Image(systemName: "magnifyingglass")
-                                                .font(.system(size: 13, weight: .semibold))
-                                                .foregroundStyle(.secondary)
-                                            TextField("Search title or file name", text: $searchQuery)
-                                                .textFieldStyle(.plain)
-                                                .font(.system(size: 14, weight: .medium, design: .rounded))
-                                        }
-                                        .padding(.horizontal, 12)
-                                        .frame(height: 38)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                                .fill(ReaderPalette.surface.opacity(0.95))
-                                                .overlay(
-                                                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                                        .strokeBorder(.white.opacity(0.72), lineWidth: 1)
-                                                )
-                                                .shadow(color: .black.opacity(0.04), radius: 8, x: 0, y: 4)
-                                        )
-
-                                        Spacer(minLength: 0)
-
-                                        Picker("View Mode", selection: $displayMode) {
-                                            Image(systemName: "square.grid.2x2")
-                                                .tag(DisplayMode.cards)
-                                            Image(systemName: "list.bullet")
-                                                .tag(DisplayMode.list)
-                                        }
-                                        .pickerStyle(.segmented)
-                                        .labelsHidden()
-                                        .frame(width: 106)
-                                        .accessibilityLabel("Library View Mode")
-                                    }
-
-                                    if filteredBooks.isEmpty {
-                                        ContentUnavailableView(
-                                            "No Matching Books",
-                                            systemImage: "doc.text.magnifyingglass",
-                                            description: Text("Try another keyword.")
-                                        )
-                                        .frame(maxWidth: .infinity, minHeight: 220)
-                                    } else if displayMode == .cards {
-                                        LazyVGrid(columns: columns, alignment: .leading, spacing: 24) {
-                                            ForEach(paginatedBooks) { book in
-                                                Button {
-                                                    onOpen(book)
-                                                } label: {
-                                                    BookCard(book: book)
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                        }
-                                    } else {
-                                        LazyVStack(alignment: .leading, spacing: 10) {
-                                            ForEach(paginatedBooks) { book in
-                                                Button {
-                                                    onOpen(book)
-                                                } label: {
-                                                    LibraryListRow(
-                                                        book: book,
-                                                        lastOpenedAt: lastOpenedAt(book.id)
-                                                    )
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                HStack {
-                                    Button {
-                                        currentPage = max(1, safePage - 1)
-                                    } label: {
-                                        Label("Previous Page", systemImage: "chevron.left")
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled(safePage <= 1)
-
-                                    Spacer(minLength: 0)
-
-                                    Text("Page \(safePage) / \(totalPages)")
-                                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                                        .foregroundStyle(.secondary)
-
-                                    Spacer(minLength: 0)
-
-                                    Button {
-                                        currentPage = min(totalPages, safePage + 1)
-                                    } label: {
-                                        Label("Next Page", systemImage: "chevron.right")
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled(safePage >= totalPages)
-                                }
-                                .padding(.top, 6)
-                            }
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 8)
-                        }
-                        .scrollIndicators(.hidden)
-                    }
-                }
-                .padding(22)
-                .background(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(.regularMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .strokeBorder(.white.opacity(0.55), lineWidth: 1)
-                        )
-                        .shadow(color: Color.black.opacity(0.06), radius: 20, x: 0, y: 10)
-                )
-                .padding(.horizontal, 30)
-                .padding(.bottom, 26)
+                shelfHeader
+                shelfContainer
             }
             .frame(maxWidth: 1480)
             .frame(maxWidth: .infinity)
@@ -589,6 +461,413 @@ private struct LibraryShelfView: View {
         .onChange(of: filteredBooks.count) { _, _ in
             currentPage = min(currentPage, totalPages)
         }
+        .onChange(of: browseMode) { _, _ in
+            currentPage = 1
+            if browseMode == .category, selectedCategory.isEmpty {
+                selectedCategory = categoryOptions.first ?? ""
+            }
+        }
+        .onChange(of: categories) { _, _ in
+            guard browseMode == .category else {
+                return
+            }
+            if !categoryOptions.contains(selectedCategory) {
+                selectedCategory = categoryOptions.first ?? ""
+            }
+        }
+        .onChange(of: books.count) { _, _ in
+            guard browseMode == .category else {
+                return
+            }
+            if !categoryOptions.contains(selectedCategory) {
+                selectedCategory = categoryOptions.first ?? ""
+            }
+        }
+        .alert(
+            "Remove Book?",
+            isPresented: Binding(
+                get: { pendingDeletionBook != nil },
+                set: { if !$0 { pendingDeletionBook = nil } }
+            ),
+            presenting: pendingDeletionBook
+        ) { book in
+            Button("Remove", role: .destructive) {
+                onDelete(book)
+                pendingDeletionBook = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeletionBook = nil
+            }
+        } message: { book in
+            Text("\"\(book.title)\" will be removed from library only. The original file will remain on disk.")
+        }
+    }
+
+    private var shelfBackground: some View {
+        LinearGradient(
+            colors: [ReaderPalette.canvasTop, ReaderPalette.canvasBottom],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
+    }
+
+    private var shelfHeader: some View {
+        HStack(alignment: .bottom, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Curious Library")
+                    .font(.system(size: 44, weight: .bold, design: .rounded))
+                    .tracking(-0.9)
+                Text("A focused shelf for PDF, EPUB, and MOBI.")
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Text("\(books.count) books")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(ReaderPalette.accent)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(
+                    Capsule()
+                        .fill(ReaderPalette.accent.opacity(0.13))
+                )
+            Button {
+                onImport()
+            } label: {
+                Label("Import", systemImage: "plus")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(ReaderPalette.accent)
+            .controlSize(.large)
+        }
+        .padding(.horizontal, 30)
+        .padding(.top, 26)
+    }
+
+    private var shelfContainer: some View {
+        Group {
+            if books.isEmpty {
+                emptyShelfContent
+            } else {
+                populatedShelfContent
+            }
+        }
+        .padding(22)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(.white.opacity(0.55), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.06), radius: 20, x: 0, y: 10)
+        )
+        .padding(.horizontal, 30)
+        .padding(.bottom, 26)
+    }
+
+    private var emptyShelfContent: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "books.vertical")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(ReaderPalette.accent)
+            Text("No Books Yet")
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+            Text("Import PDF, EPUB, or MOBI files to build your shelf.")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+            Button("Import Your First Book") {
+                onImport()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(ReaderPalette.accent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var populatedShelfContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                if !recentlyReadBooks.isEmpty {
+                    recentReadingSection
+                }
+                librarySectionDivider
+                librarySection
+                paginationSection
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 8)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private var recentReadingSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("Continue Reading")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                    .tracking(1.0)
+                Text("\(recentlyReadBooks.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(.white.opacity(0.5)))
+            }
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 14) {
+                    ForEach(recentlyReadBooks) { book in
+                        recentReadingButton(for: book)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.white.opacity(0.45))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(.white.opacity(0.7), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.04), radius: 10, x: 0, y: 6)
+        )
+    }
+
+    private var librarySectionDivider: some View {
+        Divider()
+            .overlay(ReaderPalette.accent.opacity(0.2))
+            .padding(.horizontal, 2)
+    }
+
+    private var librarySection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            librarySectionHeader
+            browseControlsRow
+            searchControlsRow
+            booksContent
+        }
+    }
+
+    private var librarySectionHeader: some View {
+        HStack(spacing: 10) {
+            Text("Library")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .tracking(1.0)
+            Spacer(minLength: 0)
+            Text("\(filteredBooks.count)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(.white.opacity(0.52)))
+        }
+    }
+
+    @ViewBuilder
+    private var browseControlsRow: some View {
+        HStack(spacing: 12) {
+            Picker("Browse Mode", selection: $browseMode) {
+                Label("All", systemImage: "books.vertical").tag(BrowseMode.all)
+                Label("By Folder", systemImage: "folder").tag(BrowseMode.category)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+            .accessibilityLabel("Browse Mode")
+
+            if browseMode == .category {
+                categorySelector
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var categorySelector: some View {
+        if categoryOptions.isEmpty {
+            Text("No categories yet")
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+        } else {
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    ForEach(categoryOptions, id: \.self) { category in
+                        categoryChip(category)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .scrollIndicators(.hidden)
+        }
+    }
+
+    private var searchControlsRow: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Search title or file name", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .medium, design: .rounded))
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 38)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(ReaderPalette.surface.opacity(0.95))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(.white.opacity(0.72), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.04), radius: 8, x: 0, y: 4)
+            )
+
+            Spacer(minLength: 0)
+
+            Picker("View Mode", selection: $displayMode) {
+                Image(systemName: "square.grid.2x2")
+                    .tag(DisplayMode.cards)
+                Image(systemName: "list.bullet")
+                    .tag(DisplayMode.list)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 106)
+            .accessibilityLabel("Library View Mode")
+        }
+    }
+
+    @ViewBuilder
+    private var booksContent: some View {
+        if filteredBooks.isEmpty {
+            ContentUnavailableView(
+                "No Matching Books",
+                systemImage: "doc.text.magnifyingglass",
+                description: Text("Try another keyword.")
+            )
+            .frame(maxWidth: .infinity, minHeight: 220)
+        } else if displayMode == .cards {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 24) {
+                ForEach(paginatedBooks) { book in
+                    libraryCardButton(for: book)
+                }
+            }
+        } else {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(paginatedBooks) { book in
+                    libraryListButton(for: book)
+                }
+            }
+        }
+    }
+
+    private var paginationSection: some View {
+        HStack {
+            Button {
+                currentPage = max(1, safePage - 1)
+            } label: {
+                Label("Previous Page", systemImage: "chevron.left")
+            }
+            .buttonStyle(.bordered)
+            .disabled(safePage <= 1)
+
+            Spacer(minLength: 0)
+
+            Text("Page \(safePage) / \(totalPages)")
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+
+            Spacer(minLength: 0)
+
+            Button {
+                currentPage = min(totalPages, safePage + 1)
+            } label: {
+                Label("Next Page", systemImage: "chevron.right")
+            }
+            .buttonStyle(.bordered)
+            .disabled(safePage >= totalPages)
+        }
+        .padding(.top, 6)
+    }
+
+    private func recentReadingButton(for book: BookDocument) -> some View {
+        Button {
+            onOpen(book)
+        } label: {
+            RecentReadingCard(
+                book: book,
+                lastOpenedAt: lastOpenedAt(book.id)
+            )
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            removeBookMenuItem(for: book)
+        }
+    }
+
+    private func libraryCardButton(for book: BookDocument) -> some View {
+        Button {
+            onOpen(book)
+        } label: {
+            BookCard(book: book)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            removeBookMenuItem(for: book)
+        }
+    }
+
+    private func libraryListButton(for book: BookDocument) -> some View {
+        Button {
+            onOpen(book)
+        } label: {
+            LibraryListRow(
+                book: book,
+                lastOpenedAt: lastOpenedAt(book.id)
+            )
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            removeBookMenuItem(for: book)
+        }
+    }
+
+    private func removeBookMenuItem(for book: BookDocument) -> some View {
+        Button(role: .destructive) {
+            pendingDeletionBook = book
+        } label: {
+            Label("Remove from Library", systemImage: "trash")
+        }
+    }
+
+    private func categoryChip(_ category: String) -> some View {
+        let isActive = selectedCategoryForDisplay == category
+        return Button {
+            selectedCategory = category
+            currentPage = 1
+        } label: {
+            Text(category)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(isActive ? Color.white : ReaderPalette.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(isActive ? ReaderPalette.accent : .white.opacity(0.6))
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .strokeBorder(.white.opacity(0.7), lineWidth: isActive ? 0 : 1)
+                        )
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 

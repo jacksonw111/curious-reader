@@ -61,6 +61,24 @@ struct ReaderSettingsSheet: View {
                     }
                 }
 
+                Section("Auto Import") {
+                    Text("Add one or more folders for auto-import (PDF/EPUB/MOBI/PRC/AZW). Duplicate books are skipped.")
+                        .foregroundStyle(.secondary)
+                    autoImportDirectoriesList
+
+                    HStack {
+                        Button("Add Folder") {
+                            model.requestAutoImportFolderSelection()
+                            dismiss()
+                        }
+                        Button("Clear All", role: .destructive) {
+                            model.clearAutoImportDirectories()
+                            saveHint = "All auto-import folders were cleared."
+                        }
+                        .disabled(model.preferences.autoImportDirectories.isEmpty)
+                    }
+                }
+
                 if let saveHint {
                     Section {
                         Text(saveHint)
@@ -91,5 +109,32 @@ struct ReaderSettingsSheet: View {
             }
         }
         .frame(minWidth: 640, minHeight: 420)
+    }
+
+    @ViewBuilder
+    private var autoImportDirectoriesList: some View {
+        if model.preferences.autoImportDirectories.isEmpty {
+            Text("No folder selected.")
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(model.preferences.autoImportDirectories) { directory in
+                    HStack(spacing: 10) {
+                        Text(directory.path)
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button(role: .destructive) {
+                            model.removeAutoImportDirectory(path: directory.path)
+                            saveHint = "Auto-import folder removed."
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+            }
+        }
     }
 }

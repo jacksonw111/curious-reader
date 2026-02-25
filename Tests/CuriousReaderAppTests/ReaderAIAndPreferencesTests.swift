@@ -31,6 +31,44 @@ final class ReaderAIAndPreferencesTests: XCTestCase {
         XCTAssertEqual(loaded, .default)
     }
 
+    func testPreferencesStorePersistsAutoImportDirectoryConfig() async throws {
+        let fileURL = makeTempFileURL(name: "preferences.json")
+        let store = ReaderPreferencesStore(storageFileURL: fileURL)
+        let expected = ReaderPreferences(
+            epubFontStyle: .roundedSans,
+            epubFontSize: 20,
+            autoImportDirectories: [
+                .init(path: "/Users/demo/books", bookmarkData: Data([0x01, 0x02, 0x03])),
+            ]
+        )
+
+        try await store.save(expected)
+        let loaded = try await store.load()
+
+        XCTAssertEqual(loaded, expected)
+    }
+
+    func testPreferencesStoreMigratesLegacySingleAutoImportDirectory() async throws {
+        let fileURL = makeTempFileURL(name: "preferences.json")
+        let payload = """
+        {
+          "epubFontStyle": "systemSans",
+          "epubFontSize": 19,
+          "autoImportDirectoryPath": "/Users/demo/legacy",
+          "autoImportDirectoryBookmarkData": "AQID"
+        }
+        """
+        try Data(payload.utf8).write(to: fileURL)
+
+        let store = ReaderPreferencesStore(storageFileURL: fileURL)
+        let loaded = try await store.load()
+
+        XCTAssertEqual(
+            loaded.autoImportDirectories,
+            [.init(path: "/Users/demo/legacy", bookmarkData: Data([0x01, 0x02, 0x03]))]
+        )
+    }
+
     func testTranslationMemoryStoreSaveAndLoadRoundTrip() async throws {
         let fileURL = makeTempFileURL(name: "translation-memory.json")
         let store = TranslationMemoryStore(storageFileURL: fileURL)
@@ -185,6 +223,36 @@ final class ReaderAIAndPreferencesTests: XCTestCase {
             }
             XCTAssertTrue(message.contains("No free OpenRouter model"))
         }
+    }
+
+    func testDeriveAutoImportCategoryUsesFirstSubdirectoryName() {
+        let root = URL(fileURLWithPath: "/tmp/library")
+        let file = URL(fileURLWithPath: "/tmp/library/Fiction/BookA.epub")
+        let category = ReaderWorkspaceModel.deriveAutoImportCategory(
+            rootDirectoryURL: root,
+            fileURL: file
+        )
+        XCTAssertEqual(category, "Fiction")
+    }
+
+    func testDeriveAutoImportCategoryReturnsNilForRootFile() {
+        let root = URL(fileURLWithPath: "/tmp/library")
+        let file = URL(fileURLWithPath: "/tmp/library/BookA.epub")
+        let category = ReaderWorkspaceModel.deriveAutoImportCategory(
+            rootDirectoryURL: root,
+            fileURL: file
+        )
+        XCTAssertNil(category)
+    }
+
+    func testDeriveAutoImportCategoryReturnsNilOutsideConfiguredRoot() {
+        let root = URL(fileURLWithPath: "/tmp/library")
+        let file = URL(fileURLWithPath: "/tmp/other/BookA.epub")
+        let category = ReaderWorkspaceModel.deriveAutoImportCategory(
+            rootDirectoryURL: root,
+            fileURL: file
+        )
+        XCTAssertNil(category)
     }
 
     private func makeTempFileURL(name: String) -> URL {
