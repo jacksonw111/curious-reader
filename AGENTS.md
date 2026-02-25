@@ -1,6 +1,6 @@
 # Curious Reader Engineering Guide
 
-更新日期：2026-02-24（美国）
+更新日期：2026-02-25（美国）
 
 ## 1. 产品目标与范围
 - 平台：macOS（原生应用，Apple Silicon 优先）。
@@ -157,3 +157,67 @@
   https://kdp.amazon.com/en_US/help/topic/G200634390
 - libmobi（MOBI 解析/转换相关开源库）  
   https://github.com/bfabiszewski/libmobi
+
+## 11. GitHub 开发生命周期规范（代理行为标准，强制）
+### 11.1 分支与集成策略
+- 采用 GitHub Flow：`main` 始终保持可发布。
+- 功能/修复必须从 `main` 拉短分支，命名规范：
+  - `feat/<area>-<topic>`
+  - `fix/<area>-<topic>`
+  - `chore/<topic>`
+- 除发布紧急修复外，禁止直接向 `main` 提交未评审代码。
+
+### 11.2 提交规范
+- 提交必须小步、可回滚、语义单一（一次提交只做一件事）。
+- 提交信息固定为 `type(scope): summary`，例如：
+  - `feat(library): add recent reading shelf`
+  - `fix(epub): make toc chapter nodes collapsible`
+- 代码变更必须同步更新文档/测试（如适用）。
+
+### 11.3 PR 与质量门禁
+- 每个分支通过 PR 合并；PR 描述必须包含：
+  - 背景与目标
+  - 变更清单
+  - 风险与回滚方案
+  - 测试证据（命令输出、截图、报告）
+- 合并前必须通过：
+  - `swift test --parallel`
+  - 打包验收：`./scripts/package-app.sh` + `./scripts/create-dmg.sh`
+  - 关键功能手测（阅读、目录、搜索、翻译、截图）
+
+### 11.4 发布策略（SemVer）
+- 版本号采用 `vMAJOR.MINOR.PATCH`（例如 `v0.1.0`）。
+- 正式发布只允许从 `main` 打 tag：
+  1. `git checkout main`
+  2. `git pull --ff-only`
+  3. `git tag vX.Y.Z`
+  4. `git push origin vX.Y.Z`
+- CI 工作流自动构建并上传 `*.app.zip` 与 `*.dmg` 到 GitHub Release。
+- `main` push 自动更新 `main-latest` 预发布，tag 发布生成正式版本。
+
+### 11.5 安全与敏感信息防护
+- 提交前必须执行敏感扫描，禁止上传：
+  - API Key / Token / 私钥 / 证书 / `.env` / 本地缓存数据
+- API Key 只存 Keychain（本项目为 OpenRouter Keychain Store）。
+- 二进制产物不入库（`dist/` 由 `.gitignore` 排除）。
+
+### 11.6 `gh` CLI 标准操作（默认执行路径）
+- 查看仓库状态：`gh repo view`
+- 创建 PR：`gh pr create`
+- 查看 CI：`gh run list` / `gh run watch`
+- 查看 Release：`gh release list` / `gh release view <tag>`
+- 代理在具备权限与上下文时，默认使用 `gh` 完成生命周期操作并回传结果。
+
+### 11.7 GitHub 实践参考
+- GitHub Docs: About pull requests  
+  https://docs.github.com/articles/about-pull-requests
+- GitHub Docs: About protected branches  
+  https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
+- GitHub Docs: About code owners  
+  https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+- GitHub Docs: About releases  
+  https://docs.github.com/repositories/releasing-projects-on-github/about-releases
+- GitHub Docs: About secret scanning  
+  https://docs.github.com/code-security/secret-scanning/about-secret-scanning
+- SemVer  
+  https://semver.org/
