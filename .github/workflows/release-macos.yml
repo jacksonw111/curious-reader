@@ -2,13 +2,15 @@ name: Release macOS
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
         description: "Release tag (e.g. v0.2.0)"
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -27,16 +29,25 @@ jobs:
         id: meta
         shell: bash
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
             TAG="${{ inputs.tag }}"
-          else
+            VERSION="${TAG#v}"
+            PRERELEASE="false"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            PRERELEASE="false"
+          else
+            TAG="main-latest"
+            VERSION="0.0.${GITHUB_RUN_NUMBER}"
+            PRERELEASE="true"
           fi
-          VERSION="${TAG#v}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "release tag: ${TAG}"
           echo "release version: ${VERSION}"
+          echo "prerelease: ${PRERELEASE}"
 
       - name: Run tests
         run: swift test --parallel
@@ -68,7 +79,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
           generate_release_notes: true
+          overwrite_files: true
           files: |
             dist/release-assets/*.dmg
             dist/release-assets/*.app.zip

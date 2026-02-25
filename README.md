@@ -99,6 +99,7 @@ swift test --parallel
 
 - 工作流文件：`.github/workflows/release-macos.yml`
 - 触发方式：
+  - 推送 `main`：自动生成/更新 `main-latest` 预发布（滚动快照）
   - 推送标签：`v*`（例如 `v0.2.0`）
   - 手动触发：`workflow_dispatch`（输入 tag）
 - 执行内容：
