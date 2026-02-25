@@ -1,0 +1,14 @@
+.DS_Store
+/.build
+/Packages
+/dist
+/coverage-report
+/*.xcresult
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.swiftpm/xcode/xcuserdata/
+.netrc
+.env
+.env.*
