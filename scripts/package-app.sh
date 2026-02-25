@@ -6,8 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="CuriousReader"
 EXECUTABLE_NAME="CuriousReaderApp"
 BUNDLE_ID="com.curious-reader.app"
-VERSION="0.1.0"
-BUILD_DIR="${ROOT_DIR}/.build/arm64-apple-macosx/release"
+VERSION="${APP_VERSION:-0.1.0}"
 DIST_DIR="${ROOT_DIR}/dist"
 APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
 MACOS_DIR="${APP_BUNDLE}/Contents/MacOS"
@@ -20,10 +19,19 @@ cd "${ROOT_DIR}"
 
 swift build -c release --product "${EXECUTABLE_NAME}"
 
+BUILD_EXECUTABLE_PATH="${ROOT_DIR}/.build/release/${EXECUTABLE_NAME}"
+if [[ ! -x "${BUILD_EXECUTABLE_PATH}" ]]; then
+  BUILD_EXECUTABLE_PATH="$(find "${ROOT_DIR}/.build" -type f -path "*/release/${EXECUTABLE_NAME}" | head -n 1)"
+fi
+if [[ -z "${BUILD_EXECUTABLE_PATH}" || ! -x "${BUILD_EXECUTABLE_PATH}" ]]; then
+  echo "Error: built executable not found for ${EXECUTABLE_NAME}" >&2
+  exit 1
+fi
+
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
-cp "${BUILD_DIR}/${EXECUTABLE_NAME}" "${MACOS_DIR}/${APP_NAME}"
+cp "${BUILD_EXECUTABLE_PATH}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
 
 cat > "${INFO_PLIST}" <<EOF

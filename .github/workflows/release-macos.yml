@@ -1,0 +1,76 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release tag: ${TAG}"
+          echo "release version: ${VERSION}"
+
+      - name: Run tests
+        run: swift test --parallel
+
+      - name: Build app bundle
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+        run: ./scripts/package-app.sh
+
+      - name: Build DMG
+        run: ./scripts/create-dmg.sh
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p dist/release-assets
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/CuriousReader.app \
+            "dist/release-assets/CuriousReader-${{ steps.meta.outputs.tag }}.app.zip"
+          cp dist/CuriousReader.dmg "dist/release-assets/CuriousReader-${{ steps.meta.outputs.tag }}.dmg"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: curious-reader-${{ steps.meta.outputs.tag }}-macos
+          path: dist/release-assets/*
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/release-assets/*.dmg
+            dist/release-assets/*.app.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

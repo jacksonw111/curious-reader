@@ -93,6 +93,27 @@ swift test --parallel
 
 - `dist/CuriousReader.dmg`
 
+## GitHub Release 自动构建
+
+仓库已配置 GitHub Actions 工作流：
+
+- 工作流文件：`.github/workflows/release-macos.yml`
+- 触发方式：
+  - 推送标签：`v*`（例如 `v0.2.0`）
+  - 手动触发：`workflow_dispatch`（输入 tag）
+- 执行内容：
+  - 运行 `swift test --parallel`
+  - 构建 `CuriousReader.app`
+  - 生成 `CuriousReader.dmg`
+  - 上传到对应 GitHub Release（`*.app.zip` + `*.dmg`）
+
+常用发布命令：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
 ## 配置说明
 
 - 阅读偏好与翻译缓存默认保存在用户 `Application Support/CuriousReader` 下
