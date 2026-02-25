@@ -1292,10 +1292,14 @@ private struct BookCoverThumbnail: View {
         .task(id: book.fileURL.path) {
             loadTask?.cancel()
             loadTask = Task {
-                let image = await BookCoverThumbnailStore.shared.thumbnail(for: book.fileURL)
+                let imageData = await BookCoverThumbnailStore.shared.thumbnailData(for: book.fileURL)
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
-                    thumbnail = image
+                    if let imageData {
+                        thumbnail = NSImage(data: imageData)
+                    } else {
+                        thumbnail = nil
+                    }
                 }
             }
         }
@@ -1308,12 +1312,12 @@ private struct BookCoverThumbnail: View {
 private actor BookCoverThumbnailStore {
     static let shared = BookCoverThumbnailStore()
 
-    private let cache = NSCache<NSString, NSImage>()
+    private let cache = NSCache<NSString, NSData>()
 
-    func thumbnail(for fileURL: URL) async -> NSImage? {
+    func thumbnailData(for fileURL: URL) async -> Data? {
         let cacheKey = fileURL.standardizedFileURL.path as NSString
         if let cached = cache.object(forKey: cacheKey) {
-            return cached
+            return cached as Data
         }
         let requestedSize = CGSize(width: 480, height: 720)
         let request = QLThumbnailGenerator.Request(
@@ -1322,15 +1326,15 @@ private actor BookCoverThumbnailStore {
             scale: 2,
             representationTypes: .thumbnail
         )
-        let image: NSImage? = await withCheckedContinuation { continuation in
+        let imageData: Data? = await withCheckedContinuation { continuation in
             QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
-                continuation.resume(returning: representation?.nsImage)
+                continuation.resume(returning: representation?.nsImage.tiffRepresentation)
             }
         }
-        if let image {
-            cache.setObject(image, forKey: cacheKey)
+        if let imageData {
+            cache.setObject(imageData as NSData, forKey: cacheKey)
         }
-        return image
+        return imageData
     }
 }
 
